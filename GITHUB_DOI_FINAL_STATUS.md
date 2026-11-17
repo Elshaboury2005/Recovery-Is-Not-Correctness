@@ -1,13 +1,13 @@
 # GitHub DOI Linkage Final Status
 
-Status: PREPARED — commit and push are pending finalization.
+Status: READY TO PUSH — scoped checks passed; push is pending final remote check.
 
 Repository: <https://github.com/Elshaboury2005/Recovery-Is-Not-Correctness>
 
 Initial local main SHA before this change:
 `24946769d9945c13634ccb0265e12739774fd7e2`
 
-Resulting DOI-linkage commit SHA: `PENDING_COMMIT`
+Resulting DOI-linkage commit SHA: `c5ee42c7f41c2d5e085cd748deaf2a71e18711a5`
 
 Pushed to `origin/main`: `PENDING_PUSH`
 
