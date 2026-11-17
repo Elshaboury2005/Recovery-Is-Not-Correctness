@@ -1,0 +1,1334 @@
+"""
+app/pipeline/executor.py
+--------------------------
+Executes an :class:`~app.pipeline.generator.ExecutionPlan` step-by-step,
+collecting per-stage metrics and structured logs into a
+:class:`~app.pipeline.context.PipelineExecutionContext`.
+
+Error handling contract
+------------------------
+The executor catches *every* exception raised by any plugin and wraps it in
+:class:`PipelineExecutionError`.  This guarantees:
+
+* The HTTP layer never receives an unhandled exception from a plugin.
+* The partial :class:`~app.pipeline.context.PipelineExecutionContext` (showing
+  how far execution reached and what metrics were collected) is always
+  accessible via ``PipelineExecutionError.context``.
+* Stack traces are preserved in the ``__cause__`` chain for debugging.
+
+Execution order
+---------------
+1. Source step  → ``plugin.read(config)`` → DataFrame
+2. [Optional] Kafka publish — if ``plan.messaging_config`` is set
+3. [Branch A — Spark] if ``plan.processing_engine_type == "spark"``:
+     a. Write DataFrame to a temp CSV
+     b. Submit ``batch_processing_job.py`` via ``SparkJobSubmitter``
+     c. Record ``spark_job`` metrics; storage step reads from Parquet output
+4. [Branch B — Pandas] otherwise:
+     Processor steps (in plan order) → ``plugin.process(df, config)`` → DataFrame
+     then Storage step → ``plugin.write(df, config)`` → metadata dict
+
+Each step's row count and wall-clock duration are recorded in
+``context.metrics[step_name]``.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import logging
+import os
+from pathlib import Path
+import threading
+import time
+import uuid
+from typing import Any
+
+import pandas as pd
+
+from app.pipeline.context import PipelineExecutionContext
+from app.pipeline.generator import ExecutionPlan, ExecutionStep
+from app.spark.spark_job_submitter import SparkJobSubmitter
+from app.storage.hdfs_client import HdfsStorageClient
+
+# Import the global progress tracker (populated during app startup by main.py).
+# The import is at module level so the singleton is shared across all callers.
+# In testing, the tracker is a no-op when run_id is None.
+from app.pipeline.progress import tracker as _progress_tracker
+
+logger = logging.getLogger(__name__)
+
+# ── Shared-filesystem rule ─────────────────────────────────────────────────────
+#
+# In Spark standalone cluster mode (spark://spark-master:7077 with client
+# deploy mode) the driver runs on the backend container but executors run on
+# spark-worker containers.  Local file-system paths (/tmp/, /app/ etc.) are
+# container-local: a file in the backend's /tmp/ is invisible to Spark workers,
+# and part files written by workers into their /tmp/ are invisible to the
+# backend.
+#
+# Rule: for Spark pipelines ALL inputs and outputs must live on a shared
+# filesystem — either HDFS (hdfs://namenode:9000/...) or a Docker volume
+# mounted to BOTH the backend and all spark-worker containers.
+#
+# Currently the only shared bind-mount is ./backend/sample-data:/app/sample-data
+# (present on backend, spark-master, and spark-worker in docker-compose.yml).
+# Everything else, including /tmp/, must go to HDFS.
+#
+# _upload_df_to_hdfs() and the output-path normalisation in _run_spark_job()
+# enforce this rule automatically so callers never need to know about it.
+
+
+def _upload_df_to_hdfs(df: pd.DataFrame, hdfs_path: str) -> None:
+    """
+    Upload *df* as a UTF-8 CSV to HDFS using the WebHDFS REST API.
+
+    WebHDFS CREATE uses a mandatory two-step HTTP redirect:
+
+    1. ``PUT NameNode?op=CREATE`` → 307 Temporary Redirect with the DataNode
+       upload URL in the ``Location`` header.
+    2. ``PUT DataNode`` with the CSV bytes → 201 Created.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        DataFrame to serialise and upload.
+    hdfs_path : str
+        Absolute HDFS path (e.g. ``/tmp/spark-input-abc123.csv``).
+
+    Raises
+    ------
+    RuntimeError
+        If either WebHDFS step fails (non-redirect / non-2xx response).
+    """
+    import requests as _requests
+    from app.core.config import get_settings
+
+    if hdfs_path.startswith("hdfs://"):
+        without_scheme = hdfs_path.split("://", 1)[1]
+        slash = without_scheme.find("/")
+        hdfs_path = without_scheme[slash:] if slash >= 0 else "/"
+
+    settings = get_settings()
+    namenode_url = settings.HDFS_NAMENODE_URL   # http://namenode:9870
+    user = settings.HDFS_USER                   # root
+
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+
+    # Step 1 — initiate CREATE; NameNode returns 307 Redirect to DataNode
+    create_url = (
+        f"{namenode_url}/webhdfs/v1{hdfs_path}"
+        f"?op=CREATE&user.name={user}&overwrite=true&replication=1"
+    )
+    resp1 = _requests.put(create_url, allow_redirects=False, timeout=15)
+    if resp1.status_code not in (200, 201, 307):
+        raise RuntimeError(
+            f"HDFS CREATE (step 1) failed with HTTP {resp1.status_code}: "
+            f"{resp1.text[:300]}"
+        )
+
+    datanode_url = resp1.headers.get("Location", "")
+    if not datanode_url:
+        raise RuntimeError("HDFS CREATE (step 1) returned no Location header.")
+
+    # Step 2 — upload CSV bytes to the DataNode URL
+    resp2 = _requests.put(datanode_url, data=csv_bytes, timeout=60)
+    if resp2.status_code not in (200, 201):
+        raise RuntimeError(
+            f"HDFS CREATE (step 2) failed with HTTP {resp2.status_code}: "
+            f"{resp2.text[:300]}"
+        )
+
+    logger.info(
+        "Staged %d-row DataFrame (%d bytes) to HDFS %s",
+        len(df), len(csv_bytes), hdfs_path,
+    )
+
+
+def _delete_hdfs_path(hdfs_path: str, recursive: bool = False) -> None:
+    """
+    Delete an HDFS path using the WebHDFS REST DELETE API.
+
+    Called in the ``finally`` block of :meth:`PipelineExecutor._run_spark_job`
+    to clean up temporary input files created for non-file sources (carry-over b),
+    and cleanup partial outputs on failure/cancellation.
+
+    Failures are logged as warnings and never propagated — cleanup is best-effort.
+
+    Parameters
+    ----------
+    hdfs_path : str
+        Absolute HDFS path (e.g. ``/tmp/spark-input-abc123.csv``) or full URI.
+    recursive : bool
+        Whether to delete directories recursively.
+    """
+    try:
+        import requests as _requests
+        from app.core.config import get_settings
+
+        if hdfs_path.startswith("hdfs://"):
+            without_scheme = hdfs_path.split("://", 1)[1]
+            slash = without_scheme.find("/")
+            hdfs_path = without_scheme[slash:] if slash >= 0 else "/"
+
+        settings = get_settings()
+        rec_str = "true" if recursive else "false"
+        url = (
+            f"{settings.HDFS_NAMENODE_URL}/webhdfs/v1{hdfs_path}"
+            f"?op=DELETE&recursive={rec_str}&user.name={settings.HDFS_USER}"
+        )
+        resp = _requests.delete(url, timeout=10)
+        if resp.status_code in (200, 404):
+            logger.info("Deleted HDFS path %s (HTTP %d).", hdfs_path, resp.status_code)
+        else:
+            logger.warning(
+                "HDFS DELETE %s returned unexpected HTTP %d: %s",
+                hdfs_path,
+                resp.status_code,
+                resp.text[:200],
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to delete HDFS path %s: %s", hdfs_path, exc)
+
+
+# ── Executor exception ─────────────────────────────────────────────────────────
+
+
+class PipelineExecutionError(Exception):
+    """
+    Raised when any plugin step fails during pipeline execution.
+
+    Wraps the original exception and carries the partial execution context so
+    callers can inspect how far the pipeline progressed before failing.
+
+    Attributes
+    ----------
+    step_name : str
+        Name of the step that failed (e.g. ``"processor:filter:2"``).
+    context : PipelineExecutionContext
+        The partial context accumulated up to the point of failure.  Metrics
+        and logs for all *successfully completed* steps are present.
+    cause : Exception
+        The original exception raised by the failing plugin.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        step_name: str,
+        context: PipelineExecutionContext,
+        cause: Exception,
+    ) -> None:
+        super().__init__(message)
+        self.step_name = step_name
+        self.context = context
+        self.cause = cause
+
+
+# ── Executor ───────────────────────────────────────────────────────────────────
+
+
+class PipelineExecutor:
+    """
+    Executes a :class:`~app.pipeline.generator.ExecutionPlan` produced by
+    :class:`~app.pipeline.generator.PipelineGenerator`.
+
+    Each call to :meth:`execute` is independent — a new
+    :class:`~app.pipeline.context.PipelineExecutionContext` is created for
+    every run.
+
+    Usage::
+
+        plan = PipelineGenerator().generate(config)
+        context = PipelineExecutor().execute(plan)
+        print(context.status)   # "success"
+        print(context.metrics)  # {step: {rows_out, duration_ms}, ...}
+    """
+
+    def execute(
+        self, plan: ExecutionPlan, tracker_run_id: str | None = None
+    ) -> PipelineExecutionContext:
+        """
+        Run all steps in *plan* in order and return the execution context.
+
+        Parameters
+        ----------
+        plan : ExecutionPlan
+            Resolved execution plan from :class:`~app.pipeline.generator.PipelineGenerator`.
+        tracker_run_id : str | None
+            When provided, progress events are emitted to the global
+            :data:`~app.pipeline.progress.tracker` under this key.  This must
+            match the ``pipeline_run_id`` stored in the database so the SSE
+            endpoint and REST endpoints can serve the same events.
+
+        Returns
+        -------
+        PipelineExecutionContext
+            Context with ``status="success"`` and metrics/logs for every step.
+
+        Raises
+        ------
+        PipelineExecutionError
+            Any step raises an exception.  The partial context is embedded in
+            the error object.
+        """
+        ctx = PipelineExecutionContext()
+        ctx.log_info(
+            "executor",
+            f"Starting pipeline '{plan.pipeline_name}' v{plan.pipeline_version} "
+            f"— run_id={ctx.run_id} engine={plan.processing_engine_type or 'pandas'}",
+        )
+
+        if plan.processing_engine_type in {"flink", "auto"}:
+            requested_engine = plan.processing_engine_type
+            ctx.status = "failed"
+            message = (
+                f"Engine '{requested_engine}' cannot be executed by the legacy executor yet. "
+                "Validate and submit it through the unified engine adapter."
+            )
+            ctx.log_info("executor", message)
+            raise PipelineExecutionError(
+                message=message,
+                step_name="engine_validation",
+                context=ctx,
+                cause=RuntimeError(message),
+            )
+
+        df: pd.DataFrame | None = None
+
+        # ── Source step ────────────────────────────────────────────────────────
+        source_step = next(s for s in plan.steps if s.step_type == "source")
+        df = self._run_source(source_step, ctx, tracker_run_id)
+
+        # ── Cancel check ───────────────────────────────────────────────────────
+        if tracker_run_id and _progress_tracker.is_cancel_requested(tracker_run_id):
+            ctx.status = "failed"
+            ctx.log_info("executor", "Pipeline cancelled after source stage.")
+            raise PipelineExecutionError(
+                message="Cancelled",
+                step_name="executor",
+                context=ctx,
+                cause=RuntimeError("Cancelled by user request"),
+            )
+
+        # ── Processing branch ──────────────────────────────────────────────────
+        if plan.streaming_enabled and plan.processing_engine_type == "spark":
+            # Streaming Spark path: coordinate topic, Kafka publishing, and Spark Structured Streaming
+            self._run_spark_streaming_job(plan, df, ctx, tracker_run_id)
+        else:
+            # ── Optional Kafka publish ─────────────────────────────────────────
+            if plan.messaging_config:
+                self._publish_to_kafka(plan.messaging_config, df, ctx, tracker_run_id)
+            else:
+                if tracker_run_id:
+                    _progress_tracker.set_stage_state(tracker_run_id, "kafka", "skipped")
+
+            # ── Cancel check ───────────────────────────────────────────────────
+            if tracker_run_id and _progress_tracker.is_cancel_requested(tracker_run_id):
+                ctx.status = "failed"
+                ctx.log_info("executor", "Pipeline cancelled after Kafka stage.")
+                raise PipelineExecutionError(
+                    message="Cancelled",
+                    step_name="executor",
+                    context=ctx,
+                    cause=RuntimeError("Cancelled by user request"),
+                )
+
+            if plan.processing_engine_type == "spark":
+                # Spark batch path: submit the whole processing block as a Spark job.
+                # The storage step afterward is skipped — Spark writes Parquet directly.
+                self._run_spark_job(plan, df, ctx, tracker_run_id)
+            else:
+                # Pandas path (Phase 3): run processors in-process, then storage.
+                for step in plan.steps:
+                    if step.step_type == "processor":
+                        df = self._run_processor(step, df, ctx)
+                    elif step.step_type == "storage":
+                        _progress_tracker.emit(tracker_run_id, "hdfs_start")
+                        self._run_storage(step, df, ctx)
+                        _progress_tracker.emit(
+                            tracker_run_id,
+                            "hdfs_done",
+                            {"rows": len(df)},
+                        )
+                    # source already handled above
+
+        ctx.status = "success"
+        from app.metrics import pipeline_records_processed_total
+        pipeline_records_processed_total.labels(plan.pipeline_name).inc(len(df))
+        ctx.log_info("executor", f"Pipeline '{plan.pipeline_name}' completed successfully.")
+        logger.info("Pipeline '%s' run %s completed.", plan.pipeline_name, ctx.run_id)
+        return ctx
+
+    # ── Step runners ───────────────────────────────────────────────────────────
+
+    def _run_source(
+        self,
+        step: ExecutionStep,
+        ctx: PipelineExecutionContext,
+        tracker_run_id: str | None = None,
+    ) -> pd.DataFrame:
+        """Execute the source step and record metrics."""
+        _progress_tracker.emit(tracker_run_id, "source_start", {"plugin": step.plugin_type})
+        ctx.log_info(step.name, f"Reading data via '{step.plugin_type}' source.")
+        t0 = time.perf_counter()
+
+        try:
+            source_path = Path(step.config["path"]) if step.plugin_type == "csv" and step.config.get("path") else None
+            source_hash = None
+            if source_path is not None and source_path.is_file():
+                with source_path.open("rb") as stream:
+                    source_hash = hashlib.file_digest(stream, "sha256").hexdigest()
+            df = step.plugin.read(step.config)
+            if source_hash is not None:
+                with source_path.open("rb") as stream:
+                    if hashlib.file_digest(stream, "sha256").hexdigest() != source_hash:
+                        raise ValueError("Source changed during ingestion; input identity is not stable")
+        except Exception as exc:
+            _progress_tracker.emit(
+                tracker_run_id,
+                "source_failed",
+                {"error": str(exc)},
+            )
+            self._handle_failure(step, ctx, exc)
+
+        duration_ms = round((time.perf_counter() - t0) * 1000, 2)
+        rows = len(df)
+        ctx.record_stage(step.name, {"rows_out": rows, "duration_ms": duration_ms, "source_sha256": source_hash})
+        from app.metrics import pipeline_processing_latency_seconds
+        pipeline_processing_latency_seconds.labels(step.name).observe(duration_ms / 1000)
+        ctx.log_info(step.name, f"Read {rows} row(s) in {duration_ms}ms.")
+        _progress_tracker.emit(
+            tracker_run_id,
+            "source_done",
+            {"rows": rows, "duration_ms": duration_ms, "source_sha256": source_hash},
+        )
+        return df
+
+    def _run_processor(
+        self,
+        step: ExecutionStep,
+        df: pd.DataFrame,
+        ctx: PipelineExecutionContext,
+    ) -> pd.DataFrame:
+        """Execute a processor step, feeding in *df* and recording metrics."""
+        rows_in = len(df)
+        ctx.log_info(
+            step.name, f"Applying '{step.plugin_type}' processor ({rows_in} rows in)."
+        )
+        t0 = time.perf_counter()
+
+        try:
+            df_out = step.plugin.process(df, step.config)
+        except Exception as exc:
+            self._handle_failure(step, ctx, exc)
+
+        duration_ms = round((time.perf_counter() - t0) * 1000, 2)
+        rows_out = len(df_out)
+        ctx.record_stage(
+            step.name,
+            {"rows_in": rows_in, "rows_out": rows_out, "duration_ms": duration_ms},
+        )
+        from app.metrics import pipeline_processing_latency_seconds
+        pipeline_processing_latency_seconds.labels(step.name).observe(duration_ms / 1000)
+        ctx.log_info(
+            step.name,
+            f"Processor '{step.plugin_type}' complete: {rows_in} → {rows_out} rows "
+            f"in {duration_ms}ms.",
+        )
+        return df_out
+
+    def _run_storage(
+        self,
+        step: ExecutionStep,
+        df: pd.DataFrame,
+        ctx: PipelineExecutionContext,
+    ) -> None:
+        """Execute the storage step and record write metadata."""
+        ctx.log_info(
+            step.name, f"Writing {len(df)} row(s) via '{step.plugin_type}' storage."
+        )
+        t0 = time.perf_counter()
+
+        try:
+            write_meta: dict = step.plugin.write(df, step.config)
+        except Exception as exc:
+            self._handle_failure(step, ctx, exc)
+
+        duration_ms = round((time.perf_counter() - t0) * 1000, 2)
+        meta_with_timing = {**write_meta, "duration_ms": duration_ms}
+        ctx.record_stage(step.name, meta_with_timing)
+        from app.metrics import pipeline_processing_latency_seconds
+        pipeline_processing_latency_seconds.labels(step.name).observe(duration_ms / 1000)
+        ctx.log_info(
+            step.name,
+            f"Wrote {write_meta.get('rows_written', '?')} row(s) to "
+            f"'{write_meta.get('path', '?')}' in {duration_ms}ms.",
+        )
+
+    # ── Kafka publish ──────────────────────────────────────────────────────────
+
+    def _publish_to_kafka(
+        self,
+        messaging_config: dict,
+        df: pd.DataFrame,
+        ctx: PipelineExecutionContext,
+        tracker_run_id: str | None = None,
+    ) -> None:
+        """
+        Publish raw source records to Kafka if messaging configuration is present.
+
+        Parameters
+        ----------
+        messaging_config : dict
+            Messaging section from PipelineConfig.
+        df : pandas.DataFrame
+            Raw source DataFrame to publish.
+        ctx : PipelineExecutionContext
+            Execution context to record metrics and logs.
+        tracker_run_id : str | None
+            If provided, emits kafka_start / kafka_done events to the tracker.
+        """
+        topic = messaging_config.get("topic")
+        if not topic:
+            return
+
+        partitions = messaging_config.get("partitions", 1)
+        replication_factor = messaging_config.get("replication_factor", 1)
+
+        t0 = time.perf_counter()
+
+        try:
+            import json
+
+            from app.messaging.kafka_admin import KafkaAdminClient
+            from app.messaging.kafka_producer import KafkaProducerClient, get_topic_end_offsets
+
+            admin = KafkaAdminClient()
+            admin.create_topic(
+                topic,
+                partitions=partitions,
+                replication_factor=replication_factor,
+            )
+
+            producer = KafkaProducerClient()
+            actual_partitions = producer.get_topic_partitions(topic) or partitions
+            _progress_tracker.emit(
+                tracker_run_id,
+                "kafka_start",
+                {"topic": topic, "partitions": actual_partitions},
+            )
+            ctx.log_info(
+                "kafka_publish", f"Publishing raw source records to Kafka topic '{topic}'."
+            )
+
+            last_probe_time = 0.0
+            last_end_offsets = None
+
+            def _on_kafka_progress(published: int, failed: int) -> None:
+                nonlocal last_probe_time, last_end_offsets
+                now = time.monotonic()
+                if now - last_probe_time >= 1.0:
+                    last_end_offsets = get_topic_end_offsets(topic)
+                    last_probe_time = now
+                if tracker_run_id:
+                    _progress_tracker.update_kafka(
+                        tracker_run_id,
+                        published=published,
+                        failed=failed,
+                        end_offsets=last_end_offsets,
+                        partitions=actual_partitions,
+                        topic=topic,
+                    )
+                    _progress_tracker.emit(
+                        tracker_run_id,
+                        "kafka_progress",
+                        {
+                            "published": published,
+                            "failed": failed,
+                            "end_offsets": last_end_offsets,
+                            "partitions": actual_partitions,
+                            "topic": topic,
+                        },
+                    )
+
+            records = json.loads(df.to_json(orient="records", date_format="iso"))
+            result = producer.produce_batch(
+                topic,
+                records,
+                on_progress=_on_kafka_progress,
+            )
+
+            final_end_offsets = get_topic_end_offsets(topic)
+            duration_ms = round((time.perf_counter() - t0) * 1000, 2)
+            meta_with_timing = {**result, "duration_ms": duration_ms}
+            ctx.record_stage("kafka_publish", meta_with_timing)
+            published = result.get("produced", 0)
+            failed = result.get("failed", 0)
+            ctx.log_info(
+                "kafka_publish",
+                f"Published {published} record(s), failed {failed} to topic "
+                f"'{topic}' in {duration_ms}ms.",
+            )
+            _progress_tracker.emit(
+                tracker_run_id,
+                "kafka_done",
+                {
+                    "count": published,
+                    "published": published,
+                    "failed": failed,
+                    "end_offsets": final_end_offsets,
+                    "partitions": actual_partitions,
+                    "topic": topic,
+                    "duration_ms": duration_ms,
+                },
+            )
+        except Exception as exc:
+            if tracker_run_id:
+                _progress_tracker.set_stage_state(
+                    tracker_run_id, "kafka", "error", error=str(exc)
+                )
+            publish_step = ExecutionStep(
+                name="kafka_publish",
+                step_type="messaging",
+                plugin_type="kafka",
+                plugin=None,
+                config=messaging_config,
+            )
+            self._handle_failure(publish_step, ctx, exc)
+
+    # ── Spark branch ───────────────────────────────────────────────────────────
+
+    def _run_spark_job(
+        self,
+        plan: ExecutionPlan,
+        df: pd.DataFrame,
+        ctx: PipelineExecutionContext,
+        tracker_run_id: str | None = None,
+    ) -> None:
+        """
+        Submit a Spark batch job for the pipeline's processing + storage steps.
+
+        Workflow
+        --------
+        1. Stage the post-source DataFrame to HDFS when the source has no file
+           path (e.g. api_source). Temp files are deleted in the finally block
+           regardless of outcome (carry-over b).
+        2. Collect the processing operations from the plan's processor steps
+           back into a config dict for ``batch_processing_job.py``.
+        3. Normalise the output path to HDFS (shared filesystem rule).
+        4. Submit via ``SparkJobSubmitter``, passing ``tracker_run_id`` so the
+           subprocess PID is registered for cancel support.
+        5. Emit ``spark_start`` / ``spark_done`` progress events.
+
+        Parameters
+        ----------
+        plan : ExecutionPlan
+            The full execution plan.
+        df : pandas.DataFrame
+            Post-source, post-Kafka DataFrame to process.
+        ctx : PipelineExecutionContext
+            Execution context for logging and metrics.
+        tracker_run_id : str | None
+            When provided, emits spark_start/spark_done events and registers
+            the subprocess PID with the tracker for cancel support.
+
+        Raises
+        ------
+        PipelineExecutionError
+            If the Spark job fails or times out.
+        """
+        from app.spark.exceptions import SparkJobFailedError, SparkJobTimeoutError
+
+        _progress_tracker.emit(tracker_run_id, "spark_start", {})
+        ctx.log_info("spark_job", "Submitting batch Spark job for processing steps.")
+        t0 = time.perf_counter()
+
+        hdfs_tmp_input: str | None = None   # HDFS path created for non-file sources
+        output_path: str | None = None
+        try:
+            source_step = next(s for s in plan.steps if s.step_type == "source")
+            input_source: str | None = source_step.config.get("path")
+
+            if not input_source:
+                # Source has no file path (e.g. api_source, kafka_source).
+                # The executor has already read data into *df* via the source plugin.
+                # We must stage *df* to HDFS so that Spark workers can read it —
+                # the backend's local /tmp/ is invisible to spark-worker containers.
+                hdfs_tmp_input = f"hdfs:///tmp/spark-input-{uuid.uuid4().hex[:8]}.csv"
+                _upload_df_to_hdfs(df, hdfs_tmp_input)
+                raw_input_path = hdfs_tmp_input.replace("hdfs://", "")
+                if not raw_input_path.startswith("/"):
+                    raw_input_path = f"/{raw_input_path}"
+                input_source = f"hdfs://namenode:9000{raw_input_path}"
+                ctx.log_info(
+                    "spark_job",
+                    f"Staged non-file source DataFrame ({len(df)} rows) "
+                    f"to HDFS at {input_source}.",
+                )
+
+            # ── Collect operations from plan ───────────────────────────────────
+            operations = [
+                step.config
+                for step in plan.steps
+                if step.step_type == "processor"
+            ]
+
+            # ── Determine output path ──────────────────────────────────────────
+            storage_step = next(
+                (s for s in plan.steps if s.step_type == "storage"), None
+            )
+            raw_path = (
+                storage_step.config.get("path", f"/tmp/spark-output-{ctx.run_id}")
+                if storage_step
+                else f"/tmp/spark-output-{ctx.run_id}"
+            )
+            is_hdfs_storage = (
+                storage_step is not None
+                and storage_step.plugin_type == "hdfs"
+            )
+
+            if raw_path.startswith("hdfs://"):
+                # Already a qualified HDFS URI — use as-is
+                output_path = raw_path
+            elif is_hdfs_storage and raw_path.startswith("/"):
+                # hdfs plugin with an absolute path — qualify it
+                output_path = f"hdfs://namenode:9000{raw_path}"
+            else:
+                # Local path (local plugin, /tmp fallback, or any non-HDFS path).
+                # Spark workers cannot access the backend's local filesystem, so
+                # we redirect to HDFS preserving the original path component.
+                # Rule: in Spark mode, ALL outputs must be on a shared filesystem.
+                if raw_path.startswith("/"):
+                    output_path = f"hdfs://namenode:9000{raw_path}"
+                else:
+                    output_path = f"hdfs://namenode:9000/tmp/spark-output-{ctx.run_id}"
+                ctx.log_info(
+                    "spark_job",
+                    f"Redirected local storage path '{raw_path}' to HDFS "
+                    f"'{output_path}' (Spark workers cannot see backend-local paths).",
+                )
+
+            processing_config = {"processing": {"operations": operations}, "schema": plan.schema_def}
+
+            # ── Submit job & background HDFS poller ────────────────────────────
+            hdfs_client = HdfsStorageClient()
+            write_mode = (
+                storage_step.config.get("mode", "overwrite")
+                if storage_step
+                else "overwrite"
+            )
+            # Only clean target directory if write_mode is overwrite, output_path is HDFS,
+            # and is strictly the run's own sub-path (never root or base directories).
+            if write_mode == "overwrite" and output_path and output_path.startswith("hdfs://"):
+                norm = hdfs_client._normalize_hdfs_path(output_path)
+                if norm not in ("/", "/data", "/data/", "/tmp", "/tmp/"):
+                    try:
+                        hdfs_client.delete(output_path, recursive=True)
+                    except Exception:
+                        pass
+
+            stop_hdfs_poller = threading.Event()
+            hdfs_poller_thread: threading.Thread | None = None
+            last_files_written = 0
+            last_bytes_written = 0
+
+            def _poll_hdfs_progress() -> None:
+                nonlocal last_files_written, last_bytes_written
+                while not stop_hdfs_poller.is_set():
+                    try:
+                        # Only poll & emit progress if HDFS stage has started (is not pending)
+                        if tracker_run_id and _progress_tracker.get_stage_state(tracker_run_id, "hdfs") != "pending":
+                            summary = None
+                            if hasattr(hdfs_client, "get_part_files_summary"):
+                                summary = hdfs_client.get_part_files_summary(output_path)
+                            if summary is None or not isinstance(summary, dict):
+                                summary = hdfs_client.content_summary(output_path)
+                            if summary is not None and isinstance(summary, dict):
+                                last_files_written = summary.get("fileCount", 0)
+                                last_bytes_written = summary.get("length", 0)
+                                _progress_tracker.emit(
+                                    tracker_run_id,
+                                    "hdfs_progress",
+                                    {
+                                        "path": output_path,
+                                        "filesWritten": last_files_written,
+                                        "bytesWritten": last_bytes_written,
+                                    },
+                                )
+                    except Exception:
+                        pass
+                    stop_hdfs_poller.wait(1.0)
+
+            hdfs_poller_thread = threading.Thread(
+                target=_poll_hdfs_progress,
+                name=f"hdfs-poller-{ctx.run_id}",
+                daemon=True,
+            )
+            hdfs_poller_thread.start()
+
+            submitter = SparkJobSubmitter()
+
+            def _on_spark_progress(prog: dict[str, Any]) -> None:
+                if tracker_run_id:
+                    _progress_tracker.emit(tracker_run_id, "spark_progress", prog)
+
+            async def _submit() -> dict[str, Any]:
+                return await submitter.submit_batch_job(
+                    input_source=input_source,
+                    output_path=output_path,
+                    processing_config=processing_config,
+                    run_id=tracker_run_id,   # register PID for cancel
+                    on_progress=_on_spark_progress,
+                )
+
+            try:
+                result = asyncio.run(_submit())
+            finally:
+                stop_hdfs_poller.set()
+                if hdfs_poller_thread is not None and hdfs_poller_thread.is_alive():
+                    hdfs_poller_thread.join(timeout=2.0)
+
+            duration_ms = round((time.perf_counter() - t0) * 1000, 2)
+            ctx.record_stage(
+                "spark_job",
+                {
+                    "input_rows": result.get("input_rows"),
+                    "output_rows": result.get("output_rows"),
+                    "duration_seconds": result.get("duration_seconds"),
+                    "output_path": output_path,
+                    "actual_output_path": output_path,
+                    "duration_ms": duration_ms,
+                },
+            )
+            ctx.log_info(
+                "spark_job",
+                f"Spark job completed: {result.get('input_rows')} → "
+                f"{result.get('output_rows')} rows in {result.get('duration_seconds')}s. "
+                f"Output: {output_path}",
+            )
+            _progress_tracker.emit(
+                tracker_run_id,
+                "spark_done",
+                {
+                    "input_rows": result.get("input_rows"),
+                    "output_rows": result.get("output_rows"),
+                    "output_path": output_path,
+                    "actual_output_path": output_path,
+                    "duration_seconds": result.get("duration_seconds"),
+                    "duration_ms": duration_ms,
+                },
+            )
+
+            # ── Verify storage output ──────────────────────────────────────────
+            # Stage hdfs: active when verification starts, done after verification.
+            # Documented: counts during write include Spark _temporary files.
+            if tracker_run_id:
+                try:
+                    _progress_tracker.emit(
+                        tracker_run_id, "hdfs_start", {"path": output_path}
+                    )
+
+                    exists = hdfs_client.path_exists(output_path)
+                    if not exists:
+                        raise RuntimeError(f"HDFS output path does not exist: {output_path}")
+
+                    final_summary = None
+                    if hasattr(hdfs_client, "get_part_files_summary"):
+                        final_summary = hdfs_client.get_part_files_summary(output_path)
+                    if final_summary is None or not isinstance(final_summary, dict):
+                        final_summary = hdfs_client.content_summary(output_path)
+
+                    final_files = (
+                        final_summary.get("fileCount", last_files_written)
+                        if final_summary is not None and isinstance(final_summary, dict)
+                        else last_files_written
+                    )
+                    final_bytes = (
+                        final_summary.get("length", last_bytes_written)
+                        if final_summary is not None and isinstance(final_summary, dict)
+                        else last_bytes_written
+                    )
+                    output_rows = result.get("output_rows")
+
+                    _progress_tracker.emit(
+                        tracker_run_id,
+                        "hdfs_done",
+                        {
+                            "path": output_path,
+                            "rows": output_rows,
+                            "filesWritten": final_files,
+                            "bytesWritten": final_bytes,
+                            "verified": True,
+                        },
+                    )
+                except Exception as verify_exc:
+                    logger.warning("Storage verification failed for %s: %s", output_path, verify_exc)
+                    _progress_tracker.update_hdfs(tracker_run_id, verified=False)
+                    _progress_tracker.set_stage_state(
+                        tracker_run_id,
+                        "hdfs",
+                        "error",
+                        error=f"Storage verification failed: {verify_exc}",
+                    )
+
+        except (SparkJobFailedError, SparkJobTimeoutError) as exc:
+            if tracker_run_id:
+                _progress_tracker.set_stage_state(
+                    tracker_run_id, "spark", "error", error=str(exc)
+                )
+            spark_step = ExecutionStep(
+                name="spark_job",
+                step_type="spark",
+                plugin_type="spark",
+                plugin=None,
+                config={},
+            )
+            if hasattr(exc, "stderr") and exc.stderr:
+                logger.error(
+                    "Spark job stderr:\n%s", "\n".join(exc.stderr.splitlines()[-30:])
+                )
+            self._handle_failure(spark_step, ctx, exc)
+        except Exception as exc:
+            if tracker_run_id:
+                _progress_tracker.set_stage_state(
+                    tracker_run_id, "spark", "error", error=str(exc)
+                )
+            spark_step = ExecutionStep(
+                name="spark_job",
+                step_type="spark",
+                plugin_type="spark",
+                plugin=None,
+                config={},
+            )
+            self._handle_failure(spark_step, ctx, exc)
+        finally:
+            # Carry-over (b): always delete temporary HDFS input files to prevent
+            # orphaned /tmp/spark-input-*.csv files on the namenode.
+            if hdfs_tmp_input is not None:
+                _delete_hdfs_path(hdfs_tmp_input)
+
+            # Step 7: Delete fallback output on fail/cancel
+            if ctx.status != "success":
+                fallback_path = f"/tmp/spark-output-{ctx.run_id}"
+                current_out = output_path or ""
+                if fallback_path in current_out:
+                    _delete_hdfs_path(current_out, recursive=True)
+
+    def _run_spark_streaming_job(
+        self,
+        plan: ExecutionPlan,
+        df: pd.DataFrame,
+        ctx: PipelineExecutionContext,
+        tracker_run_id: str | None = None,
+    ) -> None:
+        """
+        Coordinate end-to-end Spark Structured Streaming query execution.
+
+        1. Ensure topic exists with configured partitions.
+        2. Set up HDFS output and checkpoint paths.
+        3. Start StreamingCompletionDetector.
+        4. Start Spark Streaming Job asynchronously with stop_event.
+        5. Publish source records to Kafka in batches while stream is active.
+        6. Monitor lag & throughput, updating tracker until completion detector signals done.
+        7. Gracefully stop stream query, await exit, verify HDFS output, emit final metrics.
+        """
+        import json
+        from app.messaging.kafka_admin import KafkaAdminClient
+        from app.messaging.kafka_producer import KafkaProducerClient, get_topic_partition_end_offsets
+        from app.pipeline.stream_progress import (
+            StreamingCompletionDetector,
+            compute_lag,
+            wait_for_stream_start,
+        )
+        from app.spark.exceptions import SparkJobFailedError, SparkJobTimeoutError
+
+        _progress_tracker.emit(tracker_run_id, "spark_start", {})
+        ctx.log_info("spark_streaming", "Starting Structured Streaming execution...")
+        t0 = time.perf_counter()
+
+        messaging_cfg = plan.messaging_config or {}
+        topic = messaging_cfg.get("topic", "events")
+        partitions = messaging_cfg.get("partitions", 3)
+        replication_factor = messaging_cfg.get("replication_factor", 1)
+
+        streaming_cfg = plan.streaming_config or {}
+        idle_timeout = float(streaming_cfg.get("idle_timeout_seconds", 20))
+        max_runtime = float(streaming_cfg.get("max_runtime_seconds", 600))
+        startup_deadline = time.monotonic() + max_runtime
+
+        declared_columns = {column["name"] for column in plan.schema_def}
+        missing_columns = declared_columns - set(df.columns if df is not None else [])
+        if missing_columns:
+            self._handle_failure(
+                ExecutionStep(name="streaming_schema", step_type="spark", plugin_type="spark", plugin=None, config={}),
+                ctx,
+                ValueError(f"Declared streaming columns missing from source: {sorted(missing_columns)}"),
+            )
+
+        # 1. Topic setup
+        try:
+            admin = KafkaAdminClient()
+            admin.create_topic(
+                topic,
+                partitions=partitions,
+                replication_factor=replication_factor,
+            )
+        except Exception as exc:
+            ctx.log_info("spark_streaming", f"Topic check/creation for '{topic}': {exc}")
+
+        # 2. Output and checkpoint paths
+        storage_step = next((s for s in plan.steps if s.step_type == "storage"), None)
+        raw_path = (
+            storage_step.config.get("path", f"/output/stream-{ctx.run_id}")
+            if storage_step
+            else f"/output/stream-{ctx.run_id}"
+        )
+        if not raw_path.startswith("/"):
+            raw_path = f"/{raw_path}"
+        output_path = f"hdfs://namenode:9000{raw_path}"
+        checkpoint_path = f"hdfs://namenode:9000/checkpoints/streaming-{tracker_run_id or ctx.run_id}"
+
+        # 3. Build job config
+        operations = [step.config for step in plan.steps if step.step_type == "processor"]
+        job_config = {
+            "messaging": {**messaging_cfg, "bootstrap_servers": "kafka:9092"},
+            "streaming": streaming_cfg,
+            "schema": plan.schema_def,
+            "processing": {"operations": operations},
+        }
+
+        # 4. State & Detector
+        detector = StreamingCompletionDetector(
+            idle_timeout_seconds=idle_timeout,
+            max_runtime_seconds=max_runtime,
+        )
+        stop_event = asyncio.Event()
+        submitter = SparkJobSubmitter()
+
+        producer = KafkaProducerClient()
+        actual_partitions = producer.get_topic_partitions(topic) or partitions
+        _progress_tracker.emit(
+            tracker_run_id,
+            "kafka_start",
+            {"topic": topic, "partitions": actual_partitions},
+        )
+
+        stream_started_event = threading.Event()
+        latest_spark_offset: Any = None
+        total_input_rows = 0
+        latest_proc_rate: float | None = None
+        cancelled_by_user = False
+        timed_out = False
+
+        def _on_stream_started(started_data: dict[str, Any]) -> None:
+            ctx.log_info("spark_streaming", f"Spark Structured Streaming query started: {started_data}")
+            stream_started_event.set()
+
+        def _on_stream_progress(prog_data: dict[str, Any]) -> None:
+            nonlocal latest_spark_offset, total_input_rows, latest_proc_rate
+            latest_spark_offset = prog_data.get("endOffset")
+            prog_total = prog_data.get("totalInputRows")
+            if prog_total is not None:
+                total_input_rows = max(total_input_rows, int(prog_total))
+            # Absolute Kafka offsets are positions, not this run's row count.
+            proc_rate = prog_data.get("processedRowsPerSecond")
+            latest_proc_rate = float(proc_rate) if proc_rate is not None else None
+            if tracker_run_id:
+                _progress_tracker.update_spark(
+                    tracker_run_id,
+                    records_in=total_input_rows,
+                    processed_rows_per_second=latest_proc_rate,
+                )
+                _progress_tracker.emit(tracker_run_id, "stream_batch_committed", {
+                    "batch_id": prog_data.get("batchId"),
+                    "total_input_rows": prog_data.get("totalInputRows"),
+                    "spark_timestamp": prog_data.get("timestamp"),
+                    "scope": "completed query batch input; not independently verified output rows",
+                })
+
+        published_count = 0
+        producer_done = False
+        producer_error: Exception | None = None
+        publisher_stop = threading.Event()
+
+        def _publish_worker() -> None:
+            nonlocal published_count, producer_done, producer_error
+            # Cold JVM/dependency startup can exceed 30s. Use the configured
+            # overall bound and remain responsive to cancellation/query failure.
+            if not wait_for_stream_start(stream_started_event, (publisher_stop, stop_event), startup_deadline):
+                producer_error = RuntimeError("Streaming query did not start before the configured deadline or was stopped")
+                producer_done = True
+                return
+            try:
+                records = (
+                    json.loads(df.to_json(orient="records", date_format="iso"))
+                    if df is not None and not df.empty
+                    else []
+                )
+
+                def _on_k_prog(pub: int, fail: int) -> None:
+                    nonlocal published_count
+                    published_count = pub
+                    if tracker_run_id:
+                        _progress_tracker.update_kafka(
+                            tracker_run_id,
+                            published=pub,
+                            failed=fail,
+                            partitions=actual_partitions,
+                            topic=topic,
+                        )
+
+                if records:
+                    res = producer.produce_batch(topic, records, on_progress=_on_k_prog)
+                    if type(res.get("produced")) is not int:
+                        raise RuntimeError("Kafka producer returned no integer publication count")
+                    published_count = res["produced"]
+                    if res.get("failed", 0) or published_count != len(records):
+                        raise RuntimeError(f"Incomplete publication: {published_count}/{len(records)}")
+            except Exception as e:
+                producer_error = e
+                ctx.log_info("spark_streaming", f"Producer error: {e}")
+            finally:
+                producer_done = True
+                end_offs = get_topic_partition_end_offsets(topic)
+                _progress_tracker.emit(
+                    tracker_run_id,
+                    "kafka_done",
+                    {
+                        "count": published_count,
+                        "published": published_count,
+                        "failed": max(0, len(df) - published_count) if producer_error else 0,
+                        "end_offsets": sum(end_offs.values()) if end_offs is not None else None,
+                        "partitions": actual_partitions,
+                        "topic": topic,
+                    },
+                )
+
+        pub_thread = threading.Thread(target=_publish_worker, daemon=True)
+        pub_thread.start()
+
+        # Monitoring loop coroutine
+        async def _monitor_loop() -> None:
+            nonlocal cancelled_by_user, timed_out
+            while not stop_event.is_set():
+                await asyncio.sleep(1.0)
+
+                # Check if cancel requested
+                if tracker_run_id and _progress_tracker.is_cancel_requested(tracker_run_id):
+                    ctx.log_info("spark_streaming", "Cancellation requested; stopping stream.")
+                    cancelled_by_user = True
+                    stop_event.set()
+                    break
+
+                end_offsets = get_topic_partition_end_offsets(topic)
+                lag = compute_lag(end_offsets, latest_spark_offset)
+
+                import math
+                eta = (
+                    math.ceil(lag / latest_proc_rate)
+                    if (lag is not None and lag > 0 and latest_proc_rate is not None and latest_proc_rate > 0)
+                    else None
+                )
+
+                if tracker_run_id:
+                    _progress_tracker.update_kafka(
+                        tracker_run_id,
+                        published=published_count if not producer_done else None,
+                        end_offsets=sum(end_offsets.values()) if end_offsets is not None else None,
+                        consumer_lag=lag,
+                    )
+                    _progress_tracker.update_spark(
+                        tracker_run_id,
+                        records_in=total_input_rows,
+                        processed_rows_per_second=latest_proc_rate,
+                        eta_seconds=eta,
+                    )
+                    _progress_tracker.emit(
+                        tracker_run_id,
+                        "spark_progress",
+                        {
+                            "records_in": total_input_rows,
+                            "consumer_lag": lag,
+                            "consumerLag": lag,
+                            "kafka_partition_end_offsets": end_offsets,
+                            "spark_consumed_end_offsets": latest_spark_offset,
+                            "processedRowsPerSecond": latest_proc_rate,
+                            "recordsPerSecond": latest_proc_rate,
+                            "etaSeconds": eta,
+                        },
+                    )
+
+                if detector.is_complete(
+                    current_lag=lag,
+                    current_total_rows=total_input_rows,
+                    expected_total_rows=published_count,
+                    producer_done=producer_done,
+                ):
+                    ctx.log_info(
+                        "spark_streaming",
+                        f"Stream complete: published={published_count}, ingested={total_input_rows}, lag={lag}",
+                    )
+                    stop_event.set()
+                    break
+
+                if detector.is_timed_out():
+                    ctx.log_info("spark_streaming", "Stream reached max runtime; stopping.")
+                    timed_out = True
+                    stop_event.set()
+                    break
+
+        async def _execute_streaming() -> dict[str, Any]:
+            monitor_task = asyncio.create_task(_monitor_loop())
+            try:
+                job_result = await submitter.submit_streaming_job(
+                    config=job_config,
+                    output_path=output_path,
+                    checkpoint_path=checkpoint_path,
+                    run_id=tracker_run_id,
+                    on_stream_started=_on_stream_started,
+                    on_stream_progress=_on_stream_progress,
+                    stop_event=stop_event,
+                )
+                if cancelled_by_user:
+                    raise RuntimeError("Cancelled by user request")
+                if timed_out:
+                    raise TimeoutError(f"Stream exceeded max_runtime_seconds ({max_runtime}s)")
+                # A successful query cannot certify incomplete publication.
+                await asyncio.to_thread(pub_thread.join, 5.0)
+                if not producer_done:
+                    raise RuntimeError("Streaming query ended before publication completed")
+                if producer_error is not None:
+                    raise RuntimeError(f"Kafka publication failed: {producer_error}") from producer_error
+                if job_result.get("status") != "success":
+                    raise RuntimeError(f"Streaming query failed: {job_result.get('error', 'unknown error')}")
+                return job_result
+            finally:
+                if not monitor_task.done():
+                    monitor_task.cancel()
+
+        try:
+            try:
+                result = asyncio.run(_execute_streaming())
+            except Exception as exc:
+                if (tracker_run_id and _progress_tracker.is_cancel_requested(tracker_run_id)) or cancelled_by_user:
+                    ctx.status = "failed"
+                    raise PipelineExecutionError(
+                        message="Cancelled",
+                        step_name="spark_streaming",
+                        context=ctx,
+                        cause=RuntimeError("Cancelled by user request"),
+                    ) from exc
+                spark_step = ExecutionStep(
+                    name="spark_streaming",
+                    step_type="spark",
+                    plugin_type="spark",
+                    plugin=None,
+                    config={},
+                )
+                self._handle_failure(spark_step, ctx, exc)
+
+            duration_ms = round((time.perf_counter() - t0) * 1000, 2)
+            input_rows = result.get("input_rows")
+            output_rows = result.get("output_rows")
+            total_rows = output_rows
+            ctx.record_stage(
+                "spark_streaming",
+                {
+                    **result,
+                    "input_rows": input_rows,
+                    "output_rows": output_rows,
+                    "output_path": output_path,
+                    "actual_output_path": output_path,
+                    "checkpoint_path": checkpoint_path,
+                    "duration_ms": duration_ms,
+                },
+            )
+            if tracker_run_id:
+                _progress_tracker.update_spark(
+                    tracker_run_id,
+                    records_in=input_rows,
+                    records_out=output_rows,
+                    duration_ms=duration_ms,
+                )
+                _progress_tracker.emit(
+                    tracker_run_id,
+                    "spark_done",
+                    {
+                        "input_rows": input_rows,
+                        "output_rows": output_rows,
+                        "duration_ms": duration_ms,
+                        "duration_seconds": round(duration_ms / 1000.0, 2),
+                        "status": "success",
+                    },
+                )
+
+            # Verification of HDFS Parquet output
+            hdfs_client = HdfsStorageClient()
+            hdfs_rows = None
+            verification_error = None
+            try:
+                hdfs_rows = hdfs_client.count_rows(raw_path)
+            except Exception as exc:
+                verification_error = str(exc)
+                ctx.log_warning("spark_streaming", f"Output row count unavailable: {exc}")
+
+            count_agrees = hdfs_rows == output_rows if hdfs_rows is not None and output_rows is not None else None
+            ctx.record_stage("streaming_output_verification", {
+                "rows": hdfs_rows,
+                "row_count_agrees": count_agrees,
+                "method": "committed_parquet_footer_count",
+                "integrity_status": "UNKNOWN",  # Cardinality alone is not correctness.
+                "error": verification_error,
+            })
+
+            if tracker_run_id:
+                _progress_tracker.emit(
+                    tracker_run_id,
+                    "hdfs_done",
+                    {"rows": hdfs_rows, "verified": count_agrees, "path": output_path,
+                     "verification_scope": "committed_row_count_only", "error": verification_error},
+                )
+            ctx.log_info(
+                "spark_streaming",
+                f"Streaming job finished successfully: {total_rows} rows processed in {duration_ms}ms.",
+            )
+        finally:
+            publisher_stop.set()
+            pub_thread.join(timeout=1.0)
+            from app.core.config import get_settings
+            app_settings = get_settings()
+            if not getattr(app_settings, "KEEP_STREAMING_CHECKPOINTS", True):
+                try:
+                    HdfsStorageClient().delete_path(checkpoint_path, recursive=True)
+                    ctx.log_info("spark_streaming", f"Cleaned up checkpoint path: {checkpoint_path}")
+                except Exception as del_exc:
+                    ctx.log_warning("spark_streaming", f"Failed to delete checkpoint dir {checkpoint_path}: {del_exc}")
+
+
+    # ── Error handling ─────────────────────────────────────────────────────────
+
+    def _handle_failure(
+        self,
+        step: ExecutionStep,
+        ctx: PipelineExecutionContext,
+        exc: Exception,
+    ) -> None:
+        """
+        Record the failure in the context and raise :class:`PipelineExecutionError`.
+
+        This method **always raises** — the ``-> None`` return type is a
+        typing convenience so callers don't need ``raise self._handle_failure()``.
+        """
+        msg = f"Step '{step.name}' failed: {type(exc).__name__}: {exc}"
+        ctx.log_error(step.name, msg)
+        ctx.status = "failed"
+        from app.metrics import pipeline_errors_total
+        pipeline_errors_total.labels(step.name).inc()
+        logger.error("Pipeline step '%s' failed: %s", step.name, exc, exc_info=True)
+        raise PipelineExecutionError(
+            message=msg,
+            step_name=step.name,
+            context=ctx,
+            cause=exc,
+        ) from exc

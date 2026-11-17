@@ -1,0 +1,29 @@
+# Feature Status Matrix
+
+Statuses follow the transformation prompt: `NOT_STARTED`, `IN_PROGRESS`, `IMPLEMENTED_UNVERIFIED`, `VERIFIED_COMPLETE`, `PARTIALLY_SUPPORTED`, and `BLOCKED`.
+
+| Feature | Status | Baseline evidence / gap |
+|---|---|---|
+| Existing declarative pipeline configuration | VERIFIED_COMPLETE (baseline scope) | YAML parsing, validation, generator, processors, Spark/pandas execution covered by passing tests. |
+| Spark execution | VERIFIED_COMPLETE (baseline scope) | Existing Spark adapter/submitter and passing backend tests; live Spark health verified. |
+| Kafka integration | VERIFIED_COMPLETE (baseline scope) | Existing messaging routes, producer/consumer code, tests, and live broker health. |
+| HDFS/Parquet output | VERIFIED_COMPLETE (baseline scope) | Existing storage client, output oracle/manifest tests, and live HDFS health. |
+| Airflow integration | IMPLEMENTED_UNVERIFIED | Existing pipeline DAG is preserved; new `transformation_intelligence_dag` sequences profile → classify → benchmark → recommend → safe preflight and parses cleanly in the live scheduler, but has not been triggered as a duplicate live run. |
+| ChaosLab Spark reliability | VERIFIED_COMPLETE (baseline scope) | Existing fault injectors, observer/timeline code, reports, and passing tests. |
+| Monitoring baseline | PARTIALLY_SUPPORTED | Prometheus/Grafana and backend metrics exist; bounded profile/classification/benchmark/recommendation/reconfiguration collectors are now emitted, while dedicated transformation dashboards and long-term resource sampling remain. |
+| Frontend dashboard and pipeline workflows | VERIFIED_COMPLETE (baseline scope) | Existing routes/components and prior repository evidence; new transformation workflows absent. |
+| Existing 3D pipeline visualization | VERIFIED_COMPLETE (baseline scope) | Three.js scene, 2D fallback, live run progress mapping, and frontend tests exist. |
+| Full infrastructure 3D explorer | VERIFIED_COMPLETE (supported topology scope) | Read-only Docker-labeled topology API, discovered node/edge metadata, node inspection, health/search filters, recommendation-backed planned-vs-deployed comparison, 15-second refresh, and explicit WebGL fallback are implemented and verified; planned view describes architecture and never fabricates runtime containers. |
+| Flink deployment | IMPLEMENTED_UNVERIFIED | Profile-gated JobManager/TaskManager and explicit image tag added; startup blocked by Docker registry network access. |
+| Flink engine adapter | IMPLEMENTED_UNVERIFIED | REST health/status/checkpoint adapter and conservative capability matrix added; actual Flink submission remains gated on a verified artifact and runtime. |
+| Hive deployment | IMPLEMENTED_UNVERIFIED | Profile-gated Metastore/HiveServer2 boundary and config added; Hadoop/Hive startup/query compatibility not yet verified. |
+| Hive SQL Explorer | PARTIALLY_SUPPORTED | Read-only SQL validation, persisted query history/API, health boundary, unavailable-driver behavior, UI, build, regression, and browser route smoke are verified; Hive driver/service runtime and real query execution remain unavailable. |
+| Dataset profiling | VERIFIED_COMPLETE (supported local-format scope) | Bounded profiler, durable jobs/migration, discovery/profile/compare APIs, real CSV profile, `/datasets` UI, backend regression, and authenticated browser route smoke are verified; HDFS/remote profiling remains out of scope. |
+| Workload classification | VERIFIED_COMPLETE (supported Spark/local-format scope) | Deterministic rule-based classifier, profile evidence, capability matching, persistence/history API, workload-history UI, live CSV batch classification, backend regression, and browser route smoke are verified. |
+| Benchmark engine | PARTIALLY_SUPPORTED | Durable campaign/run schema, fair plan generation, measured Spark execution, independent correctness gating, comparison API, Benchmark Lab UI, and live workflow are verified; resource utilization sampling and Flink parity remain unavailable. |
+| Architecture recommendation | PARTIALLY_SUPPORTED | Evidence-gated objective-aware ranking, provenance/tradeoffs, insufficient-evidence response, persistence/API, objective recalculation, measured target selection, resource overrides, and browser-verified Advisor UI are implemented; only Spark has live measured correctness evidence. |
+| Safe reconfiguration manager | PARTIALLY_SUPPORTED | Durable proposal/preflight/approval/execution/verification/rollback state, audit evidence, Architecture Advisor controls, and a dedicated Reconfiguration Center are implemented; production cutover is deliberately not mutated and cross-engine state migration remains unsupported. |
+| Multi-engine ChaosLab | PARTIALLY_SUPPORTED | Engine-specific observability/recovery contracts, authenticated readiness API, Spark readiness, and explicit Flink safety gating are verified; Flink fault/recovery evidence remains blocked by runtime availability. |
+| Transformation database migrations | VERIFIED_COMPLETE (implemented schema scope) | Dataset profiles (`0007`), workload definitions (`0008`), benchmark campaigns (`0009`), recommendations (`0010`), reconfiguration operations (`0011`), and Hive query history (`0012`) are applied to the live database and covered by regression tests. |
+| End-to-end target workflow | VERIFIED_COMPLETE (supported Spark scope) | Live profiling → classification → benchmark → recommendation → isolated reconfiguration execution/correctness verification → rollback works for a supported Spark CSV workload; Flink parity and Hive runtime remain blocked. |
+| Transformation documentation and evaluation | VERIFIED_COMPLETE | Final transformation/validation reports, reproducible demonstration runbook, test/evidence matrices, blockers, final feature matrix, deployment guide, and session handoff are maintained with explicit unresolved optional-runtime/image limitations. |

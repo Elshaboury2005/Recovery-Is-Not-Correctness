@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+title: "ChaosFlow: Configuration-Driven Resilient Big Data Pipeline Platform"
+message: "Please cite the software and the accompanying research artifact. No DOI has been assigned to this local preparation package."
+type: software
+version: "2026-11-16-local"
+date-released: 2026-11-16
+authors:
+  - name: "ChaosFlow Contributors"
+license: MIT
+keywords:
+  - big data pipelines
+  - fault injection
+  - Kafka
+  - Spark Structured Streaming
+  - HDFS
+  - reproducibility
+  - data integrity

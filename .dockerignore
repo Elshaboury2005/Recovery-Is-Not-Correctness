@@ -1,0 +1,58 @@
+# .dockerignore – applied to all Docker builds in this repository
+
+# ── Git ────────────────────────────────────────────────────────────────────────
+.git/
+.gitignore
+
+# ── Node / Frontend ────────────────────────────────────────────────────────────
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
+# ── Python ─────────────────────────────────────────────────────────────────────
+__pycache__/
+**/__pycache__
+*.pyc
+**/*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+
+# ── Virtual environments ───────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── Testing ─────────────────────────────────────────────────────────────────────
+.pytest_cache/
+**/.pytest_cache
+playwright-report/
+test-results/
+htmlcov/
+coverage.xml
+.coverage
+
+# ── IDE / Editor ───────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# ── Environment / Secrets ──────────────────────────────────────────────────────
+.env
+*.env.local
+token.txt
+
+# ── Scratch / Temp ─────────────────────────────────────────────────────────────
+scratch*
+stream.log
+*.log
+*.tmp
+*.bak
+tmp/
+tmp
+
+# ── Large data files ───────────────────────────────────────────────────────────
+sample-data/sales_large.csv

@@ -1,0 +1,15 @@
+# Optional Flink profile configuration.
+#
+# The jobmanager/taskmanager service names are stable Compose DNS names. The
+# configuration is intentionally small until Phase 2 adds the engine adapter.
+# Checkpoints are stored in a named volume and are not treated as portable
+# Spark state.
+
+jobmanager.rpc.address: flink-jobmanager
+rest.port: 8081
+taskmanager.numberOfTaskSlots: 2
+parallelism.default: 2
+execution.checkpointing.interval: 30 s
+execution.checkpointing.mode: EXACTLY_ONCE
+state.checkpoints.dir: file:///opt/flink/checkpoints
+state.savepoints.dir: file:///opt/flink/checkpoints/savepoints
