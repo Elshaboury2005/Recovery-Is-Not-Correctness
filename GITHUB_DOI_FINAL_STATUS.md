@@ -1,6 +1,6 @@
 # GitHub DOI Linkage Final Status
 
-Status: READY TO PUSH — scoped checks passed; push is pending final remote check.
+Status: PUBLISHED — push completed and GitHub Actions passed.
 
 Repository: <https://github.com/Elshaboury2005/Recovery-Is-Not-Correctness>
 
@@ -9,9 +9,13 @@ Initial local main SHA before this change:
 
 Resulting DOI-linkage commit SHA: `c5ee42c7f41c2d5e085cd748deaf2a71e18711a5`
 
-Pushed to `origin/main`: `PENDING_PUSH`
+Pushed to `origin/main`: `YES` — remote `main` is
+`9bd53d29dbc8743c84e2abbd16a67d38d6365c0d`
 
-GitHub Actions CI status: `PENDING_PUSH`
+GitHub Actions CI status: `SUCCESS` — run
+[44186390823](https://github.com/Elshaboury2005/Recovery-Is-Not-Correctness/actions/runs/44186390823).
+Backend, frontend, security, and repository-root jobs passed. The manual E2E
+job was skipped because the workflow only runs it for `workflow_dispatch`.
 
 Software citation metadata remains in [`CITATION.cff`](CITATION.cff). The
 published dataset citation is:
