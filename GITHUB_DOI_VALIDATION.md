@@ -63,7 +63,8 @@ Status labels below are literal execution outcomes. `NOT RUN` is not a pass.
 | Existing public CI run | GitHub Actions public API query for run `44165513249` | PASS — prior run on the original main SHA completed successfully |
 | Existing public artifact metadata | GitHub Actions public API query | PASS — two non-expired artifact records observed |
 | Existing SARIF artifact content | unauthenticated public artifact download | NOT VERIFIED — GitHub returned HTTP 401; no claim is made about its contents |
-| CI for the new commit | GitHub Actions run `44186390823` for `9bd53d29dbc8743c84e2abbd16a67d38d6365c0d` | PASS — completed successfully; Backend, Frontend, Security, and Repo Root jobs passed; manual-dispatch E2E was skipped by workflow condition |
+| CI for the DOI-linkage commit | GitHub Actions run `44186390823` for `9bd53d29dbc8743c84e2abbd16a67d38d6365c0d` | PASS — completed successfully; Backend, Frontend, Security, and Repo Root jobs passed; manual-dispatch E2E was skipped by workflow condition |
+| CI for the final report commit | GitHub Actions run `44187036289` for `2b089c2586a6aacc518ff2b0cb51f0e4e7b29875` | PASS — completed successfully; Backend, Frontend, Security, and Repo Root jobs passed; manual-dispatch E2E was skipped by workflow condition |
 
 No research result, manuscript, validated Zenodo ZIP, or Git history was
 modified by the validation commands.
