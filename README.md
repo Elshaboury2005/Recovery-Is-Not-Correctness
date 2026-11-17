@@ -213,6 +213,27 @@ The evidence preserves negative, incomplete, and failure-closed outcomes. See
 `research_artifacts/MASTER_ATTEMPT_ACCOUNTING.csv`, and
 `research_artifacts/EVIDENCE_CATALOG.csv`.
 
+## Research Artifacts / Data Availability
+
+The curated, checksum-indexed public evidence is published separately as the
+Zenodo dataset [ChaosFlow: Configuration-Driven Resilient Big Data Pipeline
+Platform — Consolidated Research Evidence](https://zenodo.org/records/24325138),
+with version DOI [10.5281/zenodo.24325138](https://doi.org/10.5281/zenodo.24325138).
+The deposited file is `ChaosFlow_Research_Artifacts_FINAL.zip` with SHA-256
+`11788da06068a1ab5ebf253d3d9aebd8920d4b549487cc5248d024fa0b4db986`.
+
+The deposit contains curated, checksum-indexed public evidence and
+reproducibility material. Full private campaign logs are not part of the
+public deposit, and the public archive excludes synthetic E1--E8 planning
+material. The deposit does not claim full independent-host reproduction,
+physical durable-media commit, or universal exactly-once behavior.
+
+Dataset citation:
+
+```text
+Elshaboury, M. A. (2026). ChaosFlow: Configuration-Driven Resilient Big Data Pipeline Platform — Consolidated Research Evidence [Data set]. Zenodo. https://doi.org/10.5281/zenodo.24325138
+```
+
 ## Reproducibility
 
 Start with `REPRODUCIBILITY.md` and the protocol indexes under
@@ -253,9 +274,8 @@ scripts/              Local setup and data-generation helpers
 ## Citation
 
 Use the metadata in [`CITATION.cff`](CITATION.cff) for the software citation.
-No DOI or public Zenodo URL has been assigned. The separate Zenodo artifact
-must not be inferred from this repository and is not uploaded by this release
-preparation.
+The separately published research dataset citation and data-availability scope
+are documented in the Research Artifacts / Data Availability section above.
 
 ## License and Software Attribution
 
