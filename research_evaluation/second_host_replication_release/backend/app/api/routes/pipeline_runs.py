@@ -1,0 +1,898 @@
+"""
+app/api/routes/pipeline_runs.py
+---------------------------------
+REST and SSE endpoints for monitoring and controlling pipeline runs.
+
+Endpoints added in UI-2
+-----------------------
+GET  /api/pipeline-runs/{id}/progress
+    JSON snapshot of the current run state (stages, status, times).
+    Returns tracker data for active runs; DB data for finished runs.
+
+GET  /api/pipeline-runs/{id}/events?after={seq}
+    All progress events with seq > after.
+    Returns tracker memory for active runs; DB rows for finished runs.
+
+GET  /api/pipeline-runs/{id}/stream
+    Server-Sent Events stream with real-time progress events.
+    Supports Bearer token via Authorization header OR ?token= query param
+    (EventSource in some browsers cannot send custom headers).
+    Sends heartbeats every 15 s and a final ``event: done`` on completion.
+
+POST /api/pipeline-runs/{id}/cancel
+    Request graceful cancellation.  Sends SIGTERM to the spark-submit
+    subprocess (if active) and sets the cancel-requested flag so the
+    executor aborts at the next stage boundary.
+
+Existing endpoints (unchanged)
+-------------------------------
+GET  /api/pipeline-runs
+GET  /api/pipeline-runs/{run_id}
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import uuid as _uuid
+from datetime import datetime, timedelta, timezone
+from typing import Any, AsyncGenerator, Literal
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, ConfigDict
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.background import BackgroundTask
+
+from app.api.deps import get_current_user
+from app.core.config import get_settings
+from app.core.security import decode_access_token
+from app.database.session import get_db
+from app.models.pipeline_run import PipelineRun
+from app.models.pipeline_run_event import PipelineRunEvent
+from app.pipeline.progress import build_progress_dict, tracker
+from app.services.output_service import (
+    FileTooLargeError,
+    InvalidDownloadTokenError,
+    InvalidOutputPathError,
+    OutputNotFoundError,
+    OutputTooLargeError,
+    SchemaMismatchError,
+    StorageUnavailableError,
+    build_parquet_file,
+    create_download_token,
+    describe_output,
+    iter_csv,
+    preview_output,
+    sanitize_filename,
+    verify_download_token,
+)
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/pipeline-runs", tags=["pipeline-runs"])
+
+HEARTBEAT_INTERVAL: float = 15.0  # seconds between SSE keep-alive heartbeat frames
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+
+def _parse_run_id(run_id: str) -> _uuid.UUID:
+    try:
+        return _uuid.UUID(run_id)
+    except ValueError:
+        raise HTTPException(status_code=422, detail=f"Invalid run UUID: {run_id!r}")
+
+
+async def _get_run_or_404(db: AsyncSession, run_uuid: _uuid.UUID) -> PipelineRun:
+    run = await db.get(PipelineRun, run_uuid)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Pipeline run {run_uuid} not found.")
+    return run
+
+
+# ── SSE auth helper ────────────────────────────────────────────────────────────
+
+
+async def _verify_sse_token(token: str | None) -> str:
+    """
+    Decode and verify a JWT token for the SSE endpoint.
+
+    Raises HTTP 401 when the token is missing or invalid.
+    Returns the username (``sub`` claim) on success.
+    """
+    from jose import JWTError
+
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing authentication token.",
+        )
+    try:
+        payload = decode_access_token(token)
+        username: str | None = payload.get("sub")
+        if not username:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token: missing sub claim.",
+            )
+        return username
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token.",
+        )
+
+
+VALID_STATUSES = {"pending", "running", "succeeded", "failed", "cancelled"}
+VALID_SORTS = {"started_at_desc", "started_at_asc"}
+
+
+# ── GET /api/pipeline-runs ─────────────────────────────────────────────────────
+
+
+@router.get(
+    "",
+    summary="List all pipeline runs",
+    dependencies=[Depends(get_current_user)],
+)
+async def list_pipeline_runs(
+    db: AsyncSession = Depends(get_db),
+    status: list[str] | None = Query(default=None),
+    q: str | None = Query(default=None),
+    limit: int = Query(default=25, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    sort: str = Query(default="started_at_desc"),
+) -> JSONResponse:
+    """Return a filtered, paginated list of pipeline runs."""
+    if sort not in VALID_SORTS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid sort '{sort}'. Allowed values: {sorted(VALID_SORTS)}",
+        )
+
+    parsed_statuses: list[str] = []
+    if status is not None:
+        for item in status:
+            for s in item.split(","):
+                s_clean = s.strip()
+                if s_clean:
+                    if s_clean not in VALID_STATUSES:
+                        raise HTTPException(
+                            status_code=422,
+                            detail=f"Invalid status '{s_clean}'. Allowed values: {sorted(VALID_STATUSES)}",
+                        )
+                    parsed_statuses.append(s_clean)
+
+    from sqlalchemy import func
+    from sqlalchemy.orm import joinedload
+    from app.models.pipeline import Pipeline
+
+    base_query = select(PipelineRun).outerjoin(Pipeline, PipelineRun.pipeline_id == Pipeline.id)
+    count_query = select(func.count(PipelineRun.id)).outerjoin(Pipeline, PipelineRun.pipeline_id == Pipeline.id)
+
+    if parsed_statuses:
+        base_query = base_query.where(PipelineRun.status.in_(parsed_statuses))
+        count_query = count_query.where(PipelineRun.status.in_(parsed_statuses))
+
+    if q:
+        base_query = base_query.where(Pipeline.name.ilike(f"%{q}%"))
+        count_query = count_query.where(Pipeline.name.ilike(f"%{q}%"))
+
+    total_count = (await db.execute(count_query)).scalar_one()
+
+    if sort == "started_at_desc":
+        base_query = base_query.order_by(PipelineRun.started_at.desc().nullslast())
+    else:
+        base_query = base_query.order_by(PipelineRun.started_at.asc().nullsfirst())
+
+    base_query = base_query.options(joinedload(PipelineRun.pipeline)).limit(limit).offset(offset)
+
+    result = await db.execute(base_query)
+    runs = result.scalars().all()
+
+    return JSONResponse(
+        content=[
+            {
+                "id": str(run.id),
+                "name": run.pipeline.name if run.pipeline else str(run.pipeline_id),
+                "pipeline_id": str(run.pipeline_id),
+                "pipeline_version_id": str(run.pipeline_version_id),
+                "status": run.status,
+                "started_at": run.started_at.isoformat() if run.started_at else None,
+                "finished_at": run.finished_at.isoformat() if run.finished_at else None,
+                "error_message": run.error_message,
+                "output_path": run.output_path,
+                "actual_output_path": run.output_path,
+                "yaml_content": run.config_yaml,
+            }
+            for run in runs
+        ],
+        headers={
+            "X-Total-Count": str(total_count),
+            "Access-Control-Expose-Headers": "X-Total-Count",
+        },
+    )
+
+
+# ── GET /api/pipeline-runs/{run_id} ───────────────────────────────────────────
+
+
+@router.get(
+    "/{run_id}",
+    summary="Get a single pipeline run",
+    dependencies=[Depends(get_current_user)],
+)
+async def get_pipeline_run(
+    run_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> JSONResponse:
+    from sqlalchemy.orm import joinedload
+
+    run_uuid = _parse_run_id(run_id)
+    result = await db.execute(
+        select(PipelineRun)
+        .options(joinedload(PipelineRun.pipeline))
+        .where(PipelineRun.id == run_uuid)
+    )
+    run = result.scalars().first()
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Pipeline run {run_uuid} not found.")
+
+    return JSONResponse(
+        content={
+            "id": str(run.id),
+            "name": run.pipeline.name if run.pipeline else str(run.pipeline_id),
+            "pipeline_id": str(run.pipeline_id),
+            "pipeline_version_id": str(run.pipeline_version_id),
+            "status": run.status,
+            "started_at": run.started_at.isoformat() if run.started_at else None,
+            "finished_at": run.finished_at.isoformat() if run.finished_at else None,
+            "error_message": run.error_message,
+            "output_path": run.output_path,
+            "actual_output_path": run.output_path,
+            "yaml_content": run.config_yaml,
+        }
+    )
+
+
+# ── GET /api/pipeline-runs/{id}/progress ──────────────────────────────────────
+
+
+@router.get(
+    "/{run_id}/progress",
+    summary="Get current progress snapshot for a run",
+    dependencies=[Depends(get_current_user)],
+)
+async def get_run_progress(
+    run_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> JSONResponse:
+    """
+    Return the current progress snapshot.
+
+    If the run is still active, data comes from the in-memory tracker (fast,
+    live).  If the run has finished, data is reconstructed from the DB row
+    and any persisted events.
+
+    The ``stages`` object follows the RunProgress schema from Section 8.1:
+    unknown values are ``null``, never fabricated.
+    """
+    run_uuid = _parse_run_id(run_id)
+
+    # Try in-memory tracker first (active runs)
+    progress = tracker.get_progress(run_id)
+    if progress is not None:
+        return JSONResponse(content=progress)
+
+    # Fall back to DB for finished runs
+    run = await _get_run_or_404(db, run_uuid)
+
+    if run.last_progress_snapshot is not None:
+        return JSONResponse(content=run.last_progress_snapshot)
+
+    # Reconstruct stage data from persisted events
+    events_result = await db.execute(
+        select(PipelineRunEvent)
+        .where(PipelineRunEvent.pipeline_run_id == run_uuid)
+        .order_by(PipelineRunEvent.seq)
+    )
+    events = events_result.scalars().all()
+
+    stage_states = {
+        "source": {"key": "source", "state": "pending", "startedAt": None, "finishedAt": None, "error": None},
+        "kafka": {"key": "kafka", "state": "pending", "startedAt": None, "finishedAt": None, "error": None},
+        "spark": {"key": "spark", "state": "pending", "startedAt": None, "finishedAt": None, "error": None},
+        "hdfs": {"key": "hdfs", "state": "pending", "startedAt": None, "finishedAt": None, "error": None},
+    }
+    source_metrics = None
+    source_type = None
+    kafka_metrics = None
+    kafka_topic = None
+    spark_metrics: dict[str, Any] = {}
+    storage_metrics = None
+
+    for ev in events:
+        et = ev.event_type
+        pl = ev.payload or {}
+        ts = ev.emitted_at.isoformat() if ev.emitted_at else None
+        if et == "source_start":
+            stage_states["source"]["state"] = "active"
+            stage_states["source"]["startedAt"] = ts
+            source_type = pl.get("plugin")
+        elif et == "source_done":
+            stage_states["source"]["state"] = "done"
+            stage_states["source"]["finishedAt"] = ts
+            source_metrics = pl.get("rows")
+        elif et == "kafka_start":
+            stage_states["kafka"]["state"] = "active"
+            stage_states["kafka"]["startedAt"] = ts
+            kafka_topic = pl.get("topic")
+        elif et == "kafka_done":
+            stage_states["kafka"]["state"] = "done"
+            stage_states["kafka"]["finishedAt"] = ts
+            kafka_metrics = pl.get("count")
+            if pl.get("topic"):
+                kafka_topic = pl.get("topic")
+        elif et == "spark_start":
+            stage_states["spark"]["state"] = "active"
+            stage_states["spark"]["startedAt"] = ts
+        elif et == "spark_done":
+            stage_states["spark"]["state"] = "done"
+            stage_states["spark"]["finishedAt"] = ts
+            spark_metrics = pl
+        elif et == "hdfs_start":
+            stage_states["hdfs"]["state"] = "active"
+            stage_states["hdfs"]["startedAt"] = ts
+        elif et == "hdfs_done":
+            stage_states["hdfs"]["state"] = "done"
+            stage_states["hdfs"]["finishedAt"] = ts
+            storage_metrics = pl.get("rows")
+
+    if run.status == "succeeded":
+        for st in stage_states.values():
+            if st["state"] != "done":
+                st["state"] = "done"
+                st["finishedAt"] = run.finished_at.isoformat() if run.finished_at else None
+    elif run.status in ("failed", "cancelled"):
+        for st in stage_states.values():
+            if st["state"] == "active":
+                st["state"] = "error"
+                st["error"] = run.error_message or ("Cancelled" if run.status == "cancelled" else "Failed")
+                st["finishedAt"] = run.finished_at.isoformat() if run.finished_at else None
+            elif st["state"] == "pending":
+                st["state"] = "skipped"
+                st["finishedAt"] = run.finished_at.isoformat() if run.finished_at else None
+
+    if "output_path" not in spark_metrics and run.output_path:
+        spark_metrics["output_path"] = run.output_path
+
+    run_mode = "batch"
+    if run.config_yaml:
+        try:
+            import yaml
+            parsed_cfg = yaml.safe_load(run.config_yaml)
+            if isinstance(parsed_cfg, dict) and isinstance(parsed_cfg.get("streaming"), dict):
+                if bool(parsed_cfg["streaming"].get("enabled")):
+                    run_mode = "streaming"
+        except Exception:
+            pass
+
+    progress_dict = build_progress_dict(
+        run_id=run_id,
+        status=run.status,
+        mode=run_mode,
+        started_at=run.started_at.isoformat() if run.started_at else None,
+        updated_at=(run.finished_at or run.started_at or datetime.now(tz=timezone.utc)).isoformat(),
+        completed_at=run.finished_at.isoformat() if run.finished_at else None,
+        stages=list(stage_states.values()),
+        source_metrics=source_metrics,
+        source_type=source_type,
+        kafka_metrics=kafka_metrics,
+        kafka_topic=kafka_topic,
+        spark_metrics=spark_metrics,
+        storage_metrics=storage_metrics,
+        error=run.error_message,
+    )
+    return JSONResponse(content=progress_dict)
+
+
+# ── GET /api/pipeline-runs/{id}/events?after= ─────────────────────────────────
+
+
+@router.get(
+    "/{run_id}/events",
+    summary="List progress events since a sequence number",
+    dependencies=[Depends(get_current_user)],
+)
+async def get_run_events(
+    run_id: str,
+    after: int = Query(
+        default=0,
+        ge=0,
+        description="Return events with seq > this value (0 = all events).",
+    ),
+    db: AsyncSession = Depends(get_db),
+) -> JSONResponse:
+    """
+    Return progress events for a run since *after*.
+
+    If the run is still active, events are read from the in-memory tracker.
+    If the run is finished, events are read from the ``pipeline_run_events`` table.
+    """
+    run_uuid = _parse_run_id(run_id)
+
+    # Active run — serve from tracker
+    if tracker.is_active(run_id):
+        events = tracker.get_events_after(run_id, after)
+        return JSONResponse(content={"run_id": run_id, "events": events})
+
+    # Finished run — check run exists then query DB
+    await _get_run_or_404(db, run_uuid)
+    result = await db.execute(
+        select(PipelineRunEvent)
+        .where(
+            PipelineRunEvent.pipeline_run_id == run_uuid,
+            PipelineRunEvent.seq > after,
+        )
+        .order_by(PipelineRunEvent.seq)
+    )
+    db_events = result.scalars().all()
+    return JSONResponse(
+        content={
+            "run_id": run_id,
+            "events": [
+                {
+                    "seq": ev.seq,
+                    "event_type": ev.event_type,
+                    "payload": ev.payload,
+                    "ts": ev.emitted_at.isoformat(),
+                }
+                for ev in db_events
+            ],
+        }
+    )
+
+
+# ── GET /api/pipeline-runs/{id}/stream ────────────────────────────────────────
+
+
+async def _sse_generator(
+    run_id: str, db: AsyncSession
+) -> AsyncGenerator[str, None]:
+    """
+    Async generator that produces SSE-formatted strings.
+
+    Protocol
+    --------
+    * Replays all past events first (catch-up on reconnect).
+    * Subscribes to new events via the tracker.
+    * Sends ``event: heartbeat`` every 15 s when idle.
+    * Sends ``event: done`` when the run finishes and closes the stream.
+    """
+    run_uuid = _parse_run_id(run_id)
+
+    HEARTBEAT_INTERVAL = 15.0  # seconds
+    _sentinel = object()       # signals end-of-stream
+
+    def _fmt_event(ev: dict, event_name: str | None = None) -> str:
+        name = event_name or ev.get("event_type", "message")
+        return f"event: {name}\ndata: {json.dumps(ev)}\n\n"
+
+    def _fmt_heartbeat() -> str:
+        return f": keep-alive\n: heartbeat\nevent: heartbeat\ndata: {json.dumps({'ts': datetime.now(tz=timezone.utc).isoformat()})}\n\n"
+
+    # If the run is already finished, stream events from DB and close immediately
+    run = await db.get(PipelineRun, run_uuid)
+    if run is None:
+        yield f"event: error\ndata: {json.dumps({'detail': 'Run not found.'})}\n\n"
+        return
+
+    if run.status in ("succeeded", "failed", "cancelled"):
+        # Run already finished — replay from DB and close
+        result = await db.execute(
+            select(PipelineRunEvent)
+            .where(PipelineRunEvent.pipeline_run_id == run_uuid)
+            .order_by(PipelineRunEvent.seq)
+        )
+        for ev in result.scalars().all():
+            yield _fmt_event({
+                "seq": ev.seq,
+                "event_type": ev.event_type,
+                "payload": ev.payload,
+                "ts": ev.emitted_at.isoformat(),
+            })
+        yield f"event: done\ndata: {json.dumps({'status': run.status})}\n\n"
+        return
+
+    # Run is active — subscribe to tracker
+    queue = tracker.subscribe(run_id)
+    try:
+        # Replay past events first
+        for ev in tracker.replay_events(run_id):
+            yield _fmt_event(ev)
+
+        # Emit initial progress snapshot immediately
+        initial_progress = tracker.get_progress(run_id)
+        if initial_progress:
+            yield _fmt_event(initial_progress, "progress")
+
+        import time
+        last_progress_ts = time.time()
+        last_heartbeat_ts = time.time()
+
+        # Stream new events as they arrive
+        while True:
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=1.0)
+                yield _fmt_event(event)
+
+                # Terminal events — close stream after flushing
+                if event.get("event_type") in ("run_success", "run_failed", "run_cancelled"):
+                    status_map = {
+                        "run_success": "succeeded",
+                        "run_failed": "failed",
+                        "run_cancelled": "cancelled",
+                    }
+                    final_status = status_map.get(event["event_type"], "unknown")
+                    progress = tracker.get_progress(run_id)
+                    if progress:
+                        yield _fmt_event(progress, "progress")
+                    yield f"event: done\ndata: {json.dumps({'status': final_status})}\n\n"
+                    return
+
+            except asyncio.TimeoutError:
+                pass
+            
+            now = time.time()
+            if now - last_progress_ts >= 1.0:
+                progress = tracker.get_progress(run_id)
+                if progress:
+                    yield _fmt_event(progress, "progress")
+                last_progress_ts = now
+
+            if now - last_heartbeat_ts >= HEARTBEAT_INTERVAL:
+                # No event in 15 s — send heartbeat comment & event to keep connection alive
+                yield _fmt_heartbeat()
+                last_heartbeat_ts = now
+
+            # If the run is no longer active (tracker.finish() was called or marked done),
+            # close the stream gracefully
+            if not tracker.is_active(run_id):
+                progress = tracker.get_progress(run_id)
+                if progress:
+                    yield _fmt_event(progress, "progress")
+                final_run = await db.get(PipelineRun, run_uuid)
+                final_status = progress["status"] if progress else (final_run.status if final_run else "unknown")
+                yield f"event: done\ndata: {json.dumps({'status': final_status})}\n\n"
+                return
+    finally:
+        tracker.unsubscribe(run_id, queue)
+
+
+@router.get(
+    "/{run_id}/stream",
+    summary="Server-Sent Events stream for live run progress",
+    response_class=StreamingResponse,
+)
+async def stream_run_progress(
+    run_id: str,
+    token: str | None = Query(
+        default=None,
+        description=(
+            "JWT bearer token.  Use this query parameter when the client cannot "
+            "send custom headers (e.g. browser EventSource).  The Authorization "
+            "header is preferred."
+        ),
+    ),
+    authorization: str | None = Header(default=None),
+    db: AsyncSession = Depends(get_db),
+) -> StreamingResponse:
+    """
+    Open a Server-Sent Events stream for live progress updates.
+
+    Authentication is required.  Pass the JWT token either as:
+    * ``Authorization: Bearer <token>`` header (preferred), or
+    * ``?token=<jwt>`` query parameter (for browser EventSource).
+
+    The stream sends:
+    * All past events (replay) immediately on connect.
+    * New events as they are emitted by the executor.
+    * ``event: heartbeat`` every 15 s when idle.
+    * ``event: done`` when the run finishes, then closes.
+    """
+    # Auth: check Authorization header first, fall back to ?token
+    raw_token = token
+    if not raw_token and authorization:
+        parts = authorization.split()
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            raw_token = parts[1]
+
+    await _verify_sse_token(raw_token)
+
+    return StreamingResponse(
+        _sse_generator(run_id, db),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",    # disable nginx buffering for this stream
+        },
+    )
+
+
+# ── POST /api/pipeline-runs/{id}/cancel ───────────────────────────────────────
+
+
+@router.post(
+    "/{run_id}/cancel",
+    summary="Request cancellation of a running pipeline",
+    dependencies=[Depends(get_current_user)],
+)
+async def cancel_pipeline_run(
+    run_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> JSONResponse:
+    """
+    Send a cancellation request to a running pipeline.
+
+    If the run is in the Spark stage, SIGTERM is sent to the spark-submit
+    subprocess.  Otherwise the executor will abort at the next stage boundary.
+
+    Returns ``{"accepted": true}`` when the request is accepted, or
+    ``{"accepted": false, "detail": "..."}`` when the run is not found or
+    not currently running.
+    """
+    run_uuid = _parse_run_id(run_id)
+    run = await db.get(PipelineRun, run_uuid)
+    if run is None:
+        return JSONResponse(
+            {"accepted": False, "detail": "Run not found."},
+            status_code=404,
+        )
+    if run.status not in ("running", "active"):
+        return JSONResponse(
+            {
+                "accepted": False,
+                "detail": (
+                    f"Run {run_id} is not in 'running' state "
+                    f"(current status: '{run.status}')."
+                ),
+            },
+            status_code=409,
+        )
+
+    accepted = tracker.request_cancel(run_id)
+    if not accepted:
+        run.status = "cancelled"
+        run.finished_at = datetime.now(timezone.utc)
+        run.error_message = "Cancelled via API (no active in-memory tracker)"
+        await db.commit()
+        logger.info("Marked orphaned run %s as cancelled in DB", run_id)
+        return JSONResponse(
+            content={"accepted": True, "run_id": run_id, "detail": "Marked cancelled in DB"},
+            status_code=200,
+        )
+
+    logger.info("Cancel requested for run %s: accepted=%s", run_id, accepted)
+    return JSONResponse(
+        content={"accepted": accepted, "run_id": run_id},
+        status_code=202 if accepted else 409,
+    )
+
+
+# ── UI-6 Output Inspection & Download Endpoints ────────────────────────────────
+
+
+class DownloadLinkRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    format: Literal["csv", "parquet"]
+
+
+@router.get(
+    "/{run_id}/output",
+    summary="Get output metadata for a completed pipeline run",
+    dependencies=[Depends(get_current_user)],
+)
+async def get_run_output_metadata(
+    run_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    run_uuid = _parse_run_id(run_id)
+    run = await _get_run_or_404(db, run_uuid)
+
+    if run.status != "succeeded":
+        raise HTTPException(
+            status_code=409,
+            detail="Run has no completed output",
+        )
+
+    try:
+        return describe_output(run)
+    except InvalidOutputPathError:
+        raise HTTPException(status_code=400, detail="Output path is not allowed")
+    except OutputNotFoundError:
+        raise HTTPException(status_code=404, detail="No output files found")
+    except StorageUnavailableError:
+        raise HTTPException(status_code=503, detail="Storage is unavailable")
+    except Exception as exc:
+        logger.exception("Unexpected error describing output for run %s: %s", run_id, exc)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get(
+    "/{run_id}/output/preview",
+    summary="Get sample rows preview of pipeline run output",
+    dependencies=[Depends(get_current_user)],
+)
+async def get_run_output_preview(
+    run_id: str,
+    limit: int = Query(default=50, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    run_uuid = _parse_run_id(run_id)
+    run = await _get_run_or_404(db, run_uuid)
+
+    if run.status != "succeeded":
+        raise HTTPException(
+            status_code=409,
+            detail="Run has no completed output",
+        )
+
+    try:
+        return preview_output(run, limit=limit)
+    except InvalidOutputPathError:
+        raise HTTPException(status_code=400, detail="Output path is not allowed")
+    except OutputNotFoundError:
+        raise HTTPException(status_code=404, detail="No output files found")
+    except FileTooLargeError as exc:
+        raise HTTPException(status_code=413, detail=str(exc))
+    except StorageUnavailableError:
+        raise HTTPException(status_code=503, detail="Storage is unavailable")
+    except Exception as exc:
+        logger.exception("Unexpected error generating preview for run %s: %s", run_id, exc)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.post(
+    "/{run_id}/output/download-link",
+    summary="Generate a signed one-time download link for pipeline run output",
+)
+async def create_output_download_link(
+    run_id: str,
+    body: DownloadLinkRequest,
+    current_user: Any = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    run_uuid = _parse_run_id(run_id)
+    run = await _get_run_or_404(db, run_uuid)
+
+    if run.status != "succeeded":
+        raise HTTPException(
+            status_code=409,
+            detail="Run has no completed output",
+        )
+
+    try:
+        meta = describe_output(run)
+        settings = get_settings()
+        if meta["totalSizeBytes"] > settings.OUTPUT_DOWNLOAD_MAX_BYTES:
+            mb_total = round(meta["totalSizeBytes"] / (1024 * 1024), 1)
+            mb_max = round(settings.OUTPUT_DOWNLOAD_MAX_BYTES / (1024 * 1024), 1)
+            raise OutputTooLargeError(
+                f"Output is {mb_total} MB; maximum downloadable size is {mb_max} MB. Read it from HDFS directly."
+            )
+
+        user_str = getattr(current_user, "username", current_user) if current_user else "anonymous"
+        token = create_download_token(run, body.format, str(user_str))
+        exp_iso = (
+            datetime.now(timezone.utc)
+            + timedelta(seconds=settings.OUTPUT_DOWNLOAD_TOKEN_TTL_SECONDS)
+        ).isoformat()
+
+        return {
+            "url": f"/api/pipeline-runs/{run_id}/output/download?token={token}",
+            "expiresAt": exp_iso,
+            "expiresIn": settings.OUTPUT_DOWNLOAD_TOKEN_TTL_SECONDS,
+            "sizeBytes": meta["totalSizeBytes"],
+        }
+    except InvalidOutputPathError:
+        raise HTTPException(status_code=400, detail="Output path is not allowed")
+    except OutputNotFoundError:
+        raise HTTPException(status_code=404, detail="No output files found")
+    except OutputTooLargeError as exc:
+        raise HTTPException(status_code=413, detail=str(exc))
+    except StorageUnavailableError:
+        raise HTTPException(status_code=503, detail="Storage is unavailable")
+    except Exception as exc:
+        logger.exception("Unexpected error creating download link for run %s: %s", run_id, exc)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get(
+    "/{run_id}/output/download",
+    summary="Download pipeline output via signed one-time token",
+)
+async def download_run_output(
+    run_id: str,
+    token: str = Query(..., description="Signed one-time download token"),
+    db: AsyncSession = Depends(get_db),
+) -> StreamingResponse:
+    run_uuid = _parse_run_id(run_id)
+
+    try:
+        claims = verify_download_token(token, expected_run_id=str(run_uuid))
+    except InvalidDownloadTokenError:
+        raise HTTPException(status_code=401, detail="Invalid or expired download token.")
+
+    run = await _get_run_or_404(db, run_uuid)
+    if run.status != "succeeded":
+        raise HTTPException(
+            status_code=409,
+            detail="Run has no completed output",
+        )
+
+    fmt = claims.get("format", "csv")
+    pipeline_name = str(run.id)[:8]
+    if "pipeline" in run.__dict__ and run.__dict__["pipeline"] and getattr(run.__dict__["pipeline"], "name", None):
+        pipeline_name = run.__dict__["pipeline"].name
+    elif getattr(run, "pipeline_id", None):
+        try:
+            from app.models.pipeline import Pipeline
+            p = await db.get(Pipeline, run.pipeline_id)
+            if p and getattr(p, "name", None):
+                pipeline_name = p.name
+        except Exception:
+            pass
+    safe_name = sanitize_filename(pipeline_name)
+    filename = f"{safe_name}-{str(run.id)[:8]}.{fmt}"
+
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "no-referrer",
+    }
+
+    try:
+        if fmt == "csv":
+            return StreamingResponse(
+                iter_csv(run),
+                media_type="text/csv; charset=utf-8",
+                headers=headers,
+            )
+        elif fmt == "parquet":
+            parquet_path, cleanup_fn = build_parquet_file(run)
+
+            def _file_stream():
+                try:
+                    with open(parquet_path, "rb") as f:
+                        while chunk := f.read(65536):
+                            yield chunk
+                finally:
+                    cleanup_fn()
+
+            return StreamingResponse(
+                _file_stream(),
+                media_type="application/vnd.apache.parquet",
+                headers=headers,
+                background=BackgroundTask(cleanup_fn),
+            )
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported output format")
+    except OutputTooLargeError as exc:
+        raise HTTPException(status_code=413, detail=str(exc))
+    except InvalidOutputPathError:
+        raise HTTPException(status_code=400, detail="Output path is not allowed")
+    except OutputNotFoundError:
+        raise HTTPException(status_code=404, detail="No output files found")
+    except StorageUnavailableError:
+        raise HTTPException(status_code=503, detail="Storage is unavailable")
+    except SchemaMismatchError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Unexpected error streaming download for run %s: %s", run_id, exc)
+        raise HTTPException(status_code=500, detail="Internal server error")
+

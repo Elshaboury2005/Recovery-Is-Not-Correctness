@@ -1,0 +1,206 @@
+# Fresh, campaign-owned Compose project for the 240-run study.
+# No volumes or networks from the historical campaigns are referenced.
+name: chaosflow-240-replication
+
+networks:
+  campaign-network:
+    driver: bridge
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: "no"
+    networks: [campaign-network]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-platform_db}
+      POSTGRES_USER: ${POSTGRES_USER:-platform_user}
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}"
+    volumes:
+      - ./runtime/state/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-platform_user} -d ${POSTGRES_DB:-platform_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    restart: "no"
+    networks: [campaign-network]
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT"
+      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://kafka:9092,EXTERNAL://localhost:39093"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:29093"
+      KAFKA_LISTENERS: "INTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:29093,EXTERNAL://0.0.0.0:9093"
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    ports:
+      - "39093:9093"
+    volumes:
+      - ./runtime/state/kafka:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server kafka:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 15s
+
+  spark-master:
+    image: bitnamilegacy/spark:3.5.0
+    restart: "no"
+    networks: [campaign-network]
+    environment:
+      SPARK_MODE: master
+      SPARK_RPC_AUTHENTICATION_ENABLED: "no"
+      SPARK_RPC_ENCRYPTION_ENABLED: "no"
+      SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED: "no"
+      SPARK_SSL_ENABLED: "no"
+      SPARK_MASTER_WEBUI_PORT: 8080
+      SPARK_LOCAL_DIRS: /opt/bitnami/spark/work
+      SPARK_WORKER_DIR: /opt/bitnami/spark/work
+    ports:
+      - "38080:8080"
+      - "37077:7077"
+    volumes:
+      - ./source_snapshot/spark-jobs:/opt/spark-jobs:ro
+      - ./dataset:/app/sample-data:ro
+      - ./runtime/state/spark_tmp:/opt/bitnami/spark/work
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/8080'"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+
+  spark-worker:
+    image: bitnamilegacy/spark:3.5.0
+    restart: "no"
+    networks: [campaign-network]
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 2G
+      SPARK_RPC_AUTHENTICATION_ENABLED: "no"
+      SPARK_RPC_ENCRYPTION_ENABLED: "no"
+      SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED: "no"
+      SPARK_SSL_ENABLED: "no"
+      SPARK_LOCAL_DIRS: /opt/bitnami/spark/work
+      SPARK_WORKER_DIR: /opt/bitnami/spark/work
+    volumes:
+      - ./source_snapshot/spark-jobs:/opt/spark-jobs:ro
+      - ./dataset:/app/sample-data:ro
+      - ./runtime/state/spark_tmp:/opt/bitnami/spark/work
+
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    restart: "no"
+    networks: [campaign-network]
+    environment:
+      CORE_CONF_fs_defaultFS: hdfs://namenode:9000
+      CORE_CONF_hadoop_http_staticuser_user: root
+      HDFS_CONF_dfs_replication: 1
+      HDFS_CONF_dfs_namenode_datanode_registration_ip___hostname___check: "false"
+      CLUSTER_NAME: chaosflow-240-replication
+    ports:
+      - "39870:9870"
+      - "39000:9000"
+    volumes:
+      - ./runtime/state/hdfs/namenode:/hadoop/dfs/name
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9870/webhdfs/v1/?op=LISTSTATUS"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+
+  datanode:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    restart: "no"
+    # Campaign-scoped capability required by the declared C5 tc/netem fault.
+    # This is limited to the isolated campaign DataNode; no host interface is
+    # modified and no historical campaign container is reused.
+    cap_add:
+      - NET_ADMIN
+    networks: [campaign-network]
+    depends_on:
+      namenode:
+        condition: service_healthy
+    environment:
+      CORE_CONF_fs_defaultFS: hdfs://namenode:9000
+      CORE_CONF_hadoop_http_staticuser_user: root
+      HDFS_CONF_dfs_replication: 1
+      HDFS_CONF_dfs_namenode_datanode_registration_ip___hostname___check: "false"
+      SERVICE_PRECONDITION: namenode:9870
+    ports:
+      - "39864:9864"
+    volumes:
+      - ./runtime/state/hdfs/datanode:/hadoop/dfs/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9864/"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: chaosflow-240-replication-backend:local
+    restart: "no"
+    group_add:
+      - "986"
+    networks: [campaign-network]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      spark-master:
+        condition: service_healthy
+      namenode:
+        condition: service_healthy
+    env_file:
+      - ./.env
+    environment:
+      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-platform_user}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-platform_db}"
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_JOBS_PATH: /app/spark-jobs
+      HDFS_NAMENODE_URL: http://namenode:9870
+      HDFS_USER: root
+      SPARK_LOCAL_DIRS: /opt/chaosflow/spark-tmp
+      SPARK_SUBMIT_OPTS: "-Dspark.jars.ivy=/opt/chaosflow/spark-ivy -Divy.cache.dir=/opt/chaosflow/spark-ivy -Divy.home=/opt/chaosflow/spark-ivy -Dspark.local.dir=/opt/chaosflow/spark-tmp"
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD in .env}
+      COMPOSE_PROJECT_NAME: chaosflow-240-replication
+      PROJECT_CONTAINER_PREFIX: chaosflow-240-replication
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - ./backend/app:/app/app:ro
+      - ./backend/tests:/app/tests:ro
+      - ./backend/alembic:/app/alembic:ro
+      - ./source_snapshot/spark-jobs:/app/spark-jobs:ro
+      - ./runtime/state/spark_ivy:/opt/chaosflow/spark-ivy
+      - ./runtime/state/spark_tmp/backend:/opt/chaosflow/spark-tmp
+      - ./runtime/raw_metrics:/campaign-metrics
+      - ./observer_worker.py:/campaign/observer_worker.py:ro
+      - ./dataset:/app/sample-data:ro
+      - ./backend/sample-configs:/app/sample-configs:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "38000:8000"
+    command: ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1"]

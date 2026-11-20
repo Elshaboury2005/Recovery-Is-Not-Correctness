@@ -1,0 +1,29 @@
+pipeline:
+  name: sales-ui2b
+  version: "1.0"
+source:
+  type: csv
+  path: /app/sample-data/sales_sample.csv
+schema:
+  - { name: transaction_id, type: string }
+  - { name: amount, type: double }
+  - { name: customer_id, type: string }
+  - { name: product_id, type: string }
+  - { name: sale_date, type: string }
+processing:
+  operations:
+    - { type: remove_nulls }
+    - { type: remove_duplicates }
+    - { type: filter, condition: "amount > 0" }
+streaming:
+  enabled: false
+messaging:
+  broker: kafka
+  topic: sales-ui2b
+processing_engine:
+  type: spark
+storage:
+  type: hdfs
+  path: /data/sales_ui2b
+monitoring:
+  enabled: true
